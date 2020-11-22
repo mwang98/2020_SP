@@ -8,6 +8,8 @@
 #include <string.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #define MAX_DEPTH 2
 #define BUFF_SIZE 1024
@@ -24,15 +26,13 @@ int key;
 int depth;
 // derived 
 int n_player;
-char* playerids_str;
 int* playerids;
 // aux
-int has_record_stdio;
 int i_round;
 int win_id;
 int win_bid;
-int* player_record;
-int* player_rank;
+int* player_record;     // record number of victory
+int* player_rank;       // record rank
 FILE* read_l_child;
 FILE* read_r_child;
 FILE* write_l_child;
@@ -52,36 +52,38 @@ char buf[BUFF_SIZE];
 // utils
 void print_playerids();
 void print_fds();
+void print_bucket(int row, int col, int[][col]);
 int max(int, int);
 void reset_buf();
 void reset_round();
-void reset_palyer_record();
+void reset_player_record();
+void reset_player_rank();
 int get_player_num();
-void close_pipe(int, ...);
-void create_pipe(int, ...);
-void redirect_std_to_pipe();
-void reset_stdio();
 char* tostring(int);
 void read_message(FILE*, int*, int*);
 void read_message_v(FILE*, int, int*);
-void str_concat(char*, char*);
 
 // argument check and initialize
 int check_valid_args(int argc, char** argv);
 int check_strtol(char*, char*, long);
 void initialize(int, int, int);
+void set_child_stream();
 
 // stdio
 void get_player_ids_from_stdin();
-void get_result_from_child();
+void get_winner_from_child();
 void send_player_ids_to_child();
-void send_round_to_child();
 
 // root only
 void redirect_std_to_fifo();
-void update_win_count(int);
+void update_winner_record(int);
 void prepare_ranking();
-void send_scores_to_stdout();
+void send_ranking_to_stdout();
+
+// general host
+void redirect_std_to_pipe();
+void close_pipe(int, ...);
+void create_pipe(int, ...);
 
 int main(int argc, char** argv) {
     pid_t pid_child[2];
@@ -96,14 +98,14 @@ int main(int argc, char** argv) {
         while(1){
             get_player_ids_from_stdin();
             print_playerids();
-            fprintf(stderr, "Send pid: %d | %d\n", playerids[0], playerids[1]);
+
+            // fork child process to execute player (fork for each turn)
             if((pid_child[0] = fork()) == 0){ // child
                 fprintf(stderr, "Leaf host fork left child\n");
 
                 redirect_std_to_pipe(fdsP2CL[0], fdsCL2P[1]);
-                close_pipe(4, fdsP2CL, fdsCL2P, fdsP2CR, fdsCR2P);
-                
-                execl("./player", "player", tostring(playerids[0]), (char*)NULL);
+                close_pipe(4, fdsP2CL, fdsCL2P, fdsP2CR, fdsCR2P);      
+                execl("./player", "player", tostring(playerids[0]), (char*)0);
             }
             else{   // parent
                 if((pid_child[1] = fork()) == 0){ // child
@@ -111,20 +113,22 @@ int main(int argc, char** argv) {
 
                     redirect_std_to_pipe(fdsP2CR[0], fdsCR2P[1]);
                     close_pipe(4, fdsP2CL, fdsCL2P, fdsP2CR, fdsCR2P);
-                    execl("./player", "player", tostring(playerids[1]), (char*)NULL);
+                    execl("./player", "player", tostring(playerids[1]), (char*)0);
                 }
             }
             while(i_round++ <= N_ROUND){
-                get_result_from_child();
+                get_winner_from_child();
                 printf("%d %d\n", win_id, win_bid); fflush(stdout);
             }
+
             reset_round();
-            waitpid(pid_child[0], &status[0]);
-            waitpid(pid_child[1], &status[1]);
+            waitpid(pid_child[0], &status[0], 0);
+            waitpid(pid_child[1], &status[1], 0);
             if(win_id == END_SIG) exit(0);
         }
     }
     else{
+        // fork child process to execute other host (fork once and reuse)
         if((pid_child[0] = fork()) == 0){ // child
             if(depth == 0)
                 fprintf(stderr, "Root host fork left child\n");
@@ -153,9 +157,9 @@ int main(int argc, char** argv) {
             print_playerids();
 
             while(i_round++ <= N_ROUND){
-                get_result_from_child();
+                get_winner_from_child();
                 if(depth == 0){
-                    update_win_count(win_id);
+                    update_winner_record(win_id);
                 }
                 else{
                     printf("%d %d\n", win_id, win_bid); fflush(stdout);
@@ -166,11 +170,12 @@ int main(int argc, char** argv) {
             if(depth == 0){
                 prepare_ranking();
                 send_ranking_to_stdout();
-                reset_palyer_record();
+                reset_player_record();
+                reset_player_rank();
             }
         }
-        waitpid(pid_child[0], &status[0]);
-        waitpid(pid_child[1], &status[1]);
+        waitpid(pid_child[0], &status[0], 0);
+        waitpid(pid_child[1], &status[1], 0);
     }
     return 0;
 }
@@ -220,14 +225,11 @@ void initialize(int hid, int k, int d){
     depth = d;
     snprintf(fifo_r_pathname, sizeof(fifo_r_pathname), "fifo_%d.tmp", host_id);
     n_player = get_player_num();
-    playerids_str = malloc(n_player*2); // some pids have two char
     playerids = malloc(n_player*sizeof(int));
-    reset_palyer_record();
-    player_rank = malloc(n_player*sizeof(int));
-    for(int i = 0 ; i < n_player ; ++i) player_record[i] = 0;
-    fprintf(stderr, "Successfully read from fifo: host id[%d], key[%d], depth[%d]\n", host_id, key, depth);
-    has_record_stdio = 0;
+    reset_player_record(); 
+    reset_player_rank();
     reset_round();
+    fprintf(stderr, "Successfully read from fifo: host id[%d], key[%d], depth[%d]\n", host_id, key, depth);
 }
 
 // stdio
@@ -247,13 +249,7 @@ void send_player_ids_to_child(){
     }
     fprintf(write_r_child, "\n"); fflush(write_r_child);
 }
-void send_round_to_child(){
-    reset_buf();
-    sprintf(buf, "%d\n", i_round);
-    write(fdsP2CL[1], buf, sizeof(buf));
-    write(fdsP2CR[1], buf, sizeof(buf));
-}
-void get_result_from_child(){
+void get_winner_from_child(){
     int l_id, l_bid, r_id, r_bid;
     read_message(read_l_child, &l_id, &l_bid);
     read_message(read_r_child, &r_id, &r_bid);
@@ -277,7 +273,18 @@ void print_playerids(){
     strcat(buf, "\n");
     fprintf(stderr, "%s\n", buf);
 }
-
+void print_bucket(int row, int col, int buckets[][col]){
+    reset_buf();
+    for(int i = 0 ; i < N_POINT ; ++i){
+        for(int j = 0 ; j < N_PLAYER ; ++j){
+            char tmp[BUFF_SIZE];
+            snprintf(tmp, BUFF_SIZE, "%d ", buckets[i][j]);
+            strcat(buf, tmp);
+        }
+        strcat(buf, "\n");
+    }
+    fprintf(stderr, "%s", buf);
+}
 int max(int a, int b){
     return (a >= b)? a : b;
 }
@@ -288,9 +295,6 @@ int get_player_pos(int id){
             pos = i;
             break;
         }
-    }
-    if(pos == -1){
-        fprintf(stderr, "ID: %d | %d %d %d %d %d %d %d %d\n", id, playerids[0], playerids[1], playerids[2], playerids[3], playerids[4], playerids[5], playerids[6], playerids[7]);
     }
     assert(pos != -1);
     return pos;
@@ -304,8 +308,12 @@ void reset_buf(){
 void reset_round(){
     i_round = 1;
 }
-void reset_palyer_record(){
+void reset_player_record(){
     player_record = malloc(n_player*sizeof(int));
+    for(int i = 0 ; i < n_player ; ++i) player_record[i] = 0;
+}
+void reset_player_rank(){
+    player_rank = malloc(n_player*sizeof(int));
 }
 void create_pipe(int n_pipe, ...){
     int* fds;
@@ -366,12 +374,6 @@ void check_file_status_flag(int fd){
             fprintf(stderr, "Read write\n"); break;
     }
 }
-void str_concat(char* ret, char* s){
-    fprintf(stderr, "ret B4: %s\n", ret);
-    fprintf(stderr, "str: %s\n", s);
-    snprintf(ret, sizeof(ret), "%s%s", ret, s);
-    fprintf(stderr, "ret Af: %s\n", ret);
-}
 
 // root only
 int find_first_nonzero(int* b){
@@ -394,22 +396,7 @@ void prepare_ranking(){
         int insert_pos = find_first_nonzero(buckets[point]);
         buckets[point][insert_pos] = pid;
         fprintf(stderr, "PID: %d | POINT: %d | INSERT_POS: %d\n", pid, point, insert_pos);
-    }
-    fprintf(stderr, "%d %d %d %d %d %d %d %d\n%d %d %d %d %d %d %d %d\n%d %d %d %d %d %d %d %d\n%d %d %d %d %d %d %d %d\n%d %d %d %d %d %d %d %d\n%d %d %d %d %d %d %d %d\n%d %d %d %d %d %d %d %d\n%d %d %d %d %d %d %d %d\n%d %d %d %d %d %d %d %d\n%d %d %d %d %d %d %d %d\n%d %d %d %d %d %d %d %d\n",
-                     buckets[0][0], buckets[0][1], buckets[0][2], buckets[0][3], buckets[0][4], buckets[0][5], buckets[0][6], buckets[0][7],
-                     buckets[1][0], buckets[1][1], buckets[1][2], buckets[1][3], buckets[1][4], buckets[1][5], buckets[1][6], buckets[1][7],
-                     buckets[2][0], buckets[2][1], buckets[2][2], buckets[2][3], buckets[2][4], buckets[2][5], buckets[2][6], buckets[2][7],
-                     buckets[3][0], buckets[3][1], buckets[3][2], buckets[3][3], buckets[3][4], buckets[3][5], buckets[3][6], buckets[3][7],
-                     buckets[4][0], buckets[4][1], buckets[4][2], buckets[4][3], buckets[4][4], buckets[4][5], buckets[4][6], buckets[4][7],
-                     buckets[5][0], buckets[5][1], buckets[5][2], buckets[5][3], buckets[5][4], buckets[5][5], buckets[5][6], buckets[5][7],
-                     buckets[6][0], buckets[6][1], buckets[6][2], buckets[6][3], buckets[6][4], buckets[6][5], buckets[6][6], buckets[6][7],
-                     buckets[7][0], buckets[7][1], buckets[7][2], buckets[7][3], buckets[7][4], buckets[7][5], buckets[7][6], buckets[7][7],
-                     buckets[8][0], buckets[8][1], buckets[8][2], buckets[8][3], buckets[8][4], buckets[8][5], buckets[8][6], buckets[8][7],
-                     buckets[9][0], buckets[9][1], buckets[9][2], buckets[9][3], buckets[9][4], buckets[9][5], buckets[9][6], buckets[9][7],
-                     buckets[10][0], buckets[10][1], buckets[10][2], buckets[10][3], buckets[10][4], buckets[10][5], buckets[10][6], buckets[10][7],
-                     buckets[11][0], buckets[11][1], buckets[11][2], buckets[11][3], buckets[11][4], buckets[11][5], buckets[11][6], buckets[11][7]);
-
-                     
+    }              
     for(int i = N_POINT -1 ; i >= 0 ; --i){
         int cnt = 0;
 
@@ -422,20 +409,18 @@ void prepare_ranking(){
         }
         rank += cnt;
     }
+    print_bucket(N_POINT, N_PLAYER, buckets);
     fprintf(stderr, "Finish prepare_ranking\n");
 }
 void redirect_std_to_fifo(){
     fprintf(stderr, "In redirect_std_to_file: read from %s, write to %s\n", fifo_r_pathname, fifo_w_pathname);
-    
     int r_fd = open(fifo_r_pathname, O_RDWR);
     int w_fd = open(fifo_w_pathname, O_RDWR);
-    dup2(r_fd, STDIN_FILENO);
-    dup2(w_fd, STDOUT_FILENO);
-    close(r_fd);
-    close(w_fd);
+    dup2(r_fd, STDIN_FILENO); close(r_fd);
+    dup2(w_fd, STDOUT_FILENO); close(w_fd);
     fprintf(stderr, "Successfully redirect\n");
 }
-void update_win_count(int id){
+void update_winner_record(int id){
     if(id == END_SIG) return;
     fprintf(stderr, "Update Win Count: %d\n", id);
     int win_pos = get_player_pos(id);
