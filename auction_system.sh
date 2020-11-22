@@ -172,4 +172,4 @@ sendTerminationSig
 getFinalRecord
 
 # clear environment
-make env
+# make env
